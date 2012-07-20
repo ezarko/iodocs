@@ -27,22 +27,20 @@
 var express     = require('express'),
     util        = require('util'),
     fs          = require('fs'),
-    sys         = require('sys'),
     OAuth       = require('oauth').OAuth,
     query       = require('querystring'),
     url         = require('url'),
     http        = require('http'),
-    https       = require('https'),
+    crypto      = require('crypto'),
     redis       = require('redis'),
-    RedisStore  = require('connect-redis')(express),
-    hashlib     = require('hashlib');
+    RedisStore  = require('connect-redis')(express);
 
 // Configuration
 try {
     var configJSON = fs.readFileSync(__dirname + "/config.json");
     var config = JSON.parse(configJSON.toString());
 } catch(e) {
-    sys.puts("File config.json not found or is invalid.  Try: `cp config.json.sample config.json`");
+    console.error("File config.json not found or is invalid.  Try: `cp config.json.sample config.json`");
     process.exit(1);
 }
 
@@ -50,18 +48,16 @@ try {
 // Redis connection
 //
 var defaultDB = '0';
-var db = redis.createClient(config.redis.port, config.redis.host);
-db.auth(config.redis.password);
+var db;
 
-// Select our DB
-db.on("connect", function() {
-    db.select(defaultDB);
-    db.get("livedocs", function(err, reply) {
-        if (config.debug) {
-            console.log('Selected db \''+ defaultDB + '\' named \'' + reply + '\'');
-        }
-    });
-});
+if (process.env.REDISTOGO_URL) {
+    var rtg   = require("url").parse(process.env.REDISTOGO_URL);
+    db = require("redis").createClient(rtg.port, rtg.hostname);
+    db.auth(rtg.auth.split(":")[1]);
+} else {
+    db = redis.createClient(config.redis.port, config.redis.host);
+    db.auth(config.redis.password);
+}
 
 db.on("error", function(err) {
     if (config.debug) {
@@ -82,6 +78,13 @@ fs.readFile('public/data/apiconfig.json', 'utf-8', function(err, data) {
 });
 
 var app = module.exports = express.createServer();
+
+if (process.env.REDISTOGO_URL) {
+    var rtg   = require("url").parse(process.env.REDISTOGO_URL);
+    config.redis.host = rtg.hostname;
+    config.redis.port = rtg.port;
+    config.redis.password = rtg.auth.split(":")[1];
+}
 
 app.configure(function() {
     app.set('views', __dirname + '/views');
@@ -300,13 +303,14 @@ function processRequest(req, res, next) {
     }
 
     var paramString = query.stringify(params),
-        privateReqURL = apiConfig.protocol + '://' + apiConfig.host + (apiConfig.port ? ':' + apiConfig.port : '') + apiConfig.privatePath + methodURL,
+        privateReqURL = apiConfig.protocol + '://' + apiConfig.host + (apiConfig.port ? ':' + apiConfig.port : '') + apiConfig.privatePath + methodURL + ((paramString.length > 0) ? '?' + paramString : ""),
         options = {
             headers: {},
-            protocol: apiConfig.protocol,
+            protocol: apiConfig.protocol + ':',
             host: apiConfig.host,
+            port: apiConfig.port,
             method: httpMethod,
-            path: apiConfig.publicPath + methodURL
+            path: apiConfig.publicPath + methodURL + ((paramString.length > 0) ? '?' + paramString : "")
         };
     if (apiConfig.port) {
         options.port = apiConfig.port;
@@ -343,11 +347,15 @@ function processRequest(req, res, next) {
                 ],
                 function(err, results) {
 
-                    var apiKey = reqQuery.apiKey || results[0],
-                        apiSecret = reqQuery.apiSecret || results[1],
+                    var apiKey = (typeof reqQuery.apiKey == "undefined" || reqQuery.apiKey == "undefined")?results[0]:reqQuery.apiKey,
+                        apiSecret = (typeof reqQuery.apiSecret == "undefined" || reqQuery.apiSecret == "undefined")?results[1]:reqQuery.apiSecret,
                         accessToken = results[2],
                         accessTokenSecret = results[3];
-
+                    console.log(apiKey);
+                    console.log(apiSecret);
+                    console.log(accessToken);
+                    console.log(accessTokenSecret);
+                    
                     var oa = new OAuth(apiConfig.oauth.requestURL || null,
                                        apiConfig.oauth.accessURL || null,
                                        apiKey || null,
@@ -474,7 +482,7 @@ function processRequest(req, res, next) {
         console.log('Unsecured Call');
 
         // Add API Key to params, if any.
-        if (apiKey != '') {
+        if (apiKey != '' && apiKey != 'undefined' && apiKey != undefined) {
             switch (httpMethod) {
                 case 'GET':
                 case 'DELETE':
@@ -494,13 +502,13 @@ function processRequest(req, res, next) {
             if (apiConfig.signature.type == 'signed_md5') {
                 // Add signature parameter
                 var timeStamp = Math.round(new Date().getTime()/1000);
-                var sig = hashlib.md5('' + apiKey + apiSecret + timeStamp + '', { asString: true });
+                var sig = crypto.createHash('md5').update('' + apiKey + apiSecret + timeStamp + '').digest(apiConfig.signature.digest);
                 options.path += '&' + apiConfig.signature.sigParam + '=' + sig;
             }
             else if (apiConfig.signature.type == 'signed_sha256') { // sha256(key+secret+epoch)
                 // Add signature parameter
                 var timeStamp = Math.round(new Date().getTime()/1000);
-                var sig = hashlib.sha256('' + apiKey + apiSecret + timeStamp + '', { asString: true });
+                var sig = crypto.createHash('sha256').update('' + apiKey + apiSecret + timeStamp + '').digest(apiConfig.signature.digest);
                 options.path += '&' + apiConfig.signature.sigParam + '=' + sig;
             }
         }
@@ -601,6 +609,21 @@ function processRequest(req, res, next) {
 // Passes variables to the view
 app.dynamicHelpers({
     session: function(req, res) {
+    // If api wasn't passed in as a parameter, check the path to see if it's there
+ 	    if (!req.params.api) {
+ 	    	pathName = req.url.replace('/','');
+ 	    	// Is it a valid API - if there's a config file we can assume so
+ 	    	fs.stat('public/data/' + pathName + '.json', function (error, stats) {
+   				if (stats) {
+   					req.params.api = pathName;
+   				}
+ 			});
+ 	    }       
+ 	    // If the cookie says we're authed for this particular API, set the session to authed as well
+        if (req.params.api && req.session[req.params.api] && req.session[req.params.api]['authed']) {
+         	req.session['authed'] = true;
+        }
+
         return req.session;
     },
     apiInfo: function(req, res) {
@@ -666,6 +689,7 @@ app.get('/:api([^\.]+)', function(req, res) {
 // Only listen on $ node app.js
 
 if (!module.parent) {
-    app.listen(config.port, config.address);
+    var port = process.env.PORT || config.port;
+    app.listen(port);
     console.log("Express server listening on port %d", app.address().port);
 }
